@@ -67,6 +67,9 @@ class MCPBridge:
 
         try:
             if method == "initialize":
+                # Xiaozhi WS clients speak the legacy MCP handshake
+                # (protocolVersion + serverInfo), so this stays hardcoded rather
+                # than using the SDK's MCP 2.0 InitializationOptions shape.
                 return {
                     "jsonrpc": "2.0",
                     "id": request_id,
@@ -105,7 +108,7 @@ class MCPBridge:
                     "result": {"tools": [tool.model_dump() for tool in tools_list]},
                 }
 
-elif method == "tools/call":
+            elif method == "tools/call":
                 # Call tool
                 tool_name = params.get("name")
                 arguments = params.get("arguments", {})
