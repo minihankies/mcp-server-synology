@@ -205,7 +205,7 @@ class SynologyMCPServer:
 
                 if base_url not in self.auth_instances:
                     self.auth_instances[base_url] = SynologyAuth(
-                        base_url, verify_ssl=config.verify_ssl
+                        base_url, verify_ssl=nas_cfg.get("verify_ssl", config.verify_ssl)
                     )
 
                 auth = self.auth_instances[base_url]
@@ -240,8 +240,19 @@ class SynologyMCPServer:
                     # is destined for settings.json anyway and (b) it's
                     # useless without the password, so truncation provides
                     # no meaningful protection.
+                    # Persist the device token rather than asking the user to
+                    # copy it by hand. DSM may return a *refreshed* `did` on a
+                    # login that already presented one, which retires the old
+                    # value; keeping it only in memory means the token in
+                    # settings.json is dead as soon as this process exits, and
+                    # every later start falls back to "OTP required" (403).
                     did = result["data"].get("did")
-                    if did:
+                    if did and nas_name:
+                        if config.save_device_id(nas_name, did):
+                            logger.info(f"{label}: stored refreshed device_id")
+                    elif did:
+                        # Legacy .env single-NAS mode has no settings.json entry
+                        # to write into, so fall back to telling the user.
                         logger.warning(
                             f"{label}: 2FA bootstrap — copy this device_id into "
                             f"settings.json to skip OTP on future starts: {did}"

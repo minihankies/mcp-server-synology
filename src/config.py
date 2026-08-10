@@ -166,6 +166,12 @@ class SynologyConfig:
                         )
                         continue
 
+                    # `url` wins over host/port when present. The host/port form
+                    # below can only ever build https://host:5001 or http://host:<port>,
+                    # so it cannot address a NAS sitting behind a reverse proxy on
+                    # the default 443 (no port in the URL at all). Reverse-proxied
+                    # setups set `url` directly.
+                    explicit_url = (nas_info.get("url") or "").rstrip("/")
                     host = nas_info.get("host", "")
                     port = nas_info.get("port", 5000)
                     username = nas_info.get("username", "")
@@ -182,8 +188,10 @@ class SynologyConfig:
                     otp_code = nas_info.get("otp_code") or None
                     device_id = nas_info.get("device_id") or None
 
-                    if not host:
-                        logger.warning(f"Missing 'host' for NAS '{nas_name}' in {SETTINGS_FILE}")
+                    if not host and not explicit_url:
+                        logger.warning(
+                            f"Missing 'host' (or 'url') for NAS '{nas_name}' in {SETTINGS_FILE}"
+                        )
                         continue
                     if not username:
                         logger.warning(
@@ -196,14 +204,21 @@ class SynologyConfig:
                         )
                         continue
 
-                    scheme = "https" if port == 5001 else "http"
-                    base_url = f"{scheme}://{host}:{port}"
+                    if explicit_url:
+                        base_url = explicit_url
+                    else:
+                        scheme = "https" if port == 5001 else "http"
+                        base_url = f"{scheme}://{host}:{port}"
 
                     self.nas_configs[nas_name] = {
                         "base_url": base_url,
                         "username": username,
                         "password": password,
-                        "verify_ssl": self.verify_ssl,
+                        # Per-NAS override, falling back to the global server setting.
+                        # A proxied NAS with a real cert wants True; one addressed by
+                        # IP with DSM's self-signed cert wants False. One global flag
+                        # cannot serve both once more than one NAS is configured.
+                        "verify_ssl": nas_info.get("verify_ssl", self.verify_ssl),
                         "note": nas_info.get("note", ""),
                         "otp_code": otp_code,
                         "device_id": device_id,
@@ -288,6 +303,55 @@ class SynologyConfig:
             "otp_code": self.synology_otp_code,
             "device_id": None,
         }
+
+    def save_device_id(self, nas_name: str, device_id: str) -> bool:
+        """Persist a DSM trusted-device token back to settings.json.
+
+        DSM can hand back a fresh `did` on a login that already presented one.
+        The old token stops working at that point, so a token kept only in
+        memory survives exactly one process. MCP servers are restarted every
+        session, which turns that into "2FA works once, then 403 forever".
+
+        Rewrites only this NAS's `device_id`, preserving everything else in the
+        file, and clears any spent `otp_code` alongside it. Returns True on a
+        successful write.
+        """
+        if not device_id or not SETTINGS_FILE.exists():
+            return False
+
+        try:
+            data = json.loads(SETTINGS_FILE.read_text())
+            entry = data.get("synology", {}).get(nas_name)
+            if entry is None:
+                logger.warning(f"Cannot persist device_id: NAS '{nas_name}' not in settings")
+                return False
+            if entry.get("device_id") == device_id:
+                return False  # unchanged, nothing to write
+
+            entry["device_id"] = device_id
+            # A one-shot OTP is spent once DSM has issued a device token.
+            # Leaving it behind makes the next start look like a first-time
+            # 2FA login and fail on a stale code.
+            entry.pop("otp_code", None)
+
+            # Write via a 0600 temp file in the same directory, then rename, so
+            # the secrets never briefly exist world-readable and a crash
+            # mid-write cannot truncate the real file.
+            tmp = SETTINGS_FILE.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(data, indent=2) + "\n")
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, SETTINGS_FILE)
+
+            # Keep the in-memory copy in step with disk.
+            if nas_name in self.nas_configs:
+                self.nas_configs[nas_name]["device_id"] = device_id
+                self.nas_configs[nas_name]["otp_code"] = None
+
+            logger.info(f"Persisted refreshed device_id for '{nas_name}'")
+            return True
+        except (OSError, json.JSONDecodeError) as e:
+            logger.error(f"Failed to persist device_id for '{nas_name}': {e}")
+            return False
 
     def resolve_base_url(self, nas_name: str) -> Optional[str]:
         """Get the base_url for a NAS name, or None if not found."""
